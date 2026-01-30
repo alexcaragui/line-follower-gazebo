@@ -85,6 +85,32 @@ class LineFollowerNode(Node):
         self.stop_sign_kp = None
         self.stop_sign_des = None
         
+        # Right-arrow sign detection (SIFT + FLANN)
+        self.right_arrow_template = None
+        self.right_arrow_kp = None
+        self.right_arrow_des = None
+        self.right_arrow_detected = False
+        self.turn_right_counter = 0
+        self.turn_right_threshold = 3  # confirm detection over N frames
+        
+        # FLANN matcher for arrow sign detection
+        FLANN_INDEX_KDTREE = 0
+        index_params = {'algorithm': FLANN_INDEX_KDTREE, 'trees': 5}
+        search_params = {'checks': 50}
+        self.flann_matcher = cv2.FlannBasedMatcher(index_params, search_params)
+        
+        # Sign detection thresholds
+        self.MIN_MATCH_COUNT = 5
+        self.MIN_MSE_DECISION = 70000
+        # Right-arrow timing: wait before turning and cooldown
+        self.right_detected_since = None
+        self.right_wait_sec = 3.0
+        self.right_cooldown_until = 0.0
+        # Executing turn state (sustain turning for a duration)
+        self.executing_turn_until = 0.0
+        self.turn_duration = 1.2  # seconds to perform the turn once started
+        self.turn_angular_speed = 1.0  # angular speed used during turn
+        
         # Load stop sign template if provided
         if stop_sign_path and os.path.exists(stop_sign_path):
             self.stop_sign_template = cv2.imread(stop_sign_path)
@@ -95,6 +121,22 @@ class LineFollowerNode(Node):
                 self.get_logger().info(f'Stop sign has {len(self.stop_sign_kp)} SIFT keypoints')
             else:
                 self.get_logger().warn(f'Failed to load stop sign from {stop_sign_path}')
+        
+        # Load right arrow template
+        pkg_dir = '/home/alex/turtlebot3_ws/src/line_follower_fsdetect'
+        right_arrow_path = os.path.join(pkg_dir, 'right.png')
+        if os.path.exists(right_arrow_path):
+            self.right_arrow_template = cv2.imread(right_arrow_path, 0)  # grayscale
+            if self.right_arrow_template is not None:
+                self.right_arrow_kp, self.right_arrow_des = self.sift.detectAndCompute(
+                    self.right_arrow_template, None
+                )
+                self.get_logger().info(f'Loaded right arrow template from {right_arrow_path}')
+                self.get_logger().info(f'Right arrow has {len(self.right_arrow_kp)} SIFT keypoints')
+            else:
+                self.get_logger().warn(f'Failed to load right arrow from {right_arrow_path}')
+        else:
+            self.get_logger().info(f'Right arrow template not found at {right_arrow_path}')
         
         # Create subscriptions and publishers
         self.image_sub = self.create_subscription(
@@ -228,6 +270,55 @@ class LineFollowerNode(Node):
             self.get_logger().warn(f'Error in SIFT detection: {e}')
             return False
     
+    def detect_right_arrow_sign(self, frame_gray):
+        """Detect right-arrow sign using SIFT+FLANN matching.
+        Returns True if detected with sufficient matches and low MSE, False otherwise."""
+        if self.right_arrow_des is None or len(self.right_arrow_kp) < self.MIN_MATCH_COUNT:
+            return False
+        
+        try:
+            kp_frame, des_frame = self.sift.detectAndCompute(frame_gray, None)
+            
+            if des_frame is None or len(kp_frame) < self.MIN_MATCH_COUNT:
+                return False
+            
+            # Use FLANN matcher
+            matches = self.flann_matcher.knnMatch(des_frame, self.right_arrow_des, k=2)
+            
+            # Apply Lowe's ratio test
+            good_matches = []
+            for match_pair in matches:
+                if len(match_pair) == 2:
+                    m, n = match_pair
+                    if m.distance < 0.7 * n.distance:
+                        good_matches.append(m)
+            
+            # Check if enough matches
+            if len(good_matches) < self.MIN_MATCH_COUNT:
+                return False
+            
+            # Compute homography and MSE to verify match quality
+            try:
+                src_pts = np.float32([kp_frame[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                dst_pts = np.float32([self.right_arrow_kp[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                
+                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                
+                # Calculate MSE
+                mse = np.sum((src_pts - dst_pts) ** 2) / len(src_pts)
+                
+                if mse < self.MIN_MSE_DECISION:
+                    self.get_logger().info(f'Right arrow detected! MSE: {mse:.2f}, Matches: {len(good_matches)}')
+                    return True
+            except Exception as e:
+                self.get_logger().warn(f'Homography error in right arrow detection: {e}')
+                return False
+            
+            return False
+        except Exception as e:
+            self.get_logger().warn(f'Error in right arrow SIFT detection: {e}')
+            return False
+    
     def image_callback(self, msg):
         """Process camera image and calculate steering command."""
         try:
@@ -278,6 +369,26 @@ class LineFollowerNode(Node):
                 self.canny_threshold2
             )
 
+            # Detect right-arrow sign (debounced) with cooldown
+            right_arrow_detected = self.detect_right_arrow_sign(gray)
+            # ignore detection if in cooldown period
+            if time.time() < self.right_cooldown_until:
+                right_arrow_detected = False
+            if right_arrow_detected:
+                self.turn_right_counter += 1
+            else:
+                self.turn_right_counter = max(0, self.turn_right_counter - 1)
+
+            # Confirm right arrow detection over threshold frames
+            if self.turn_right_counter >= self.turn_right_threshold:
+                if not self.right_arrow_detected:
+                    # start waiting timer before turning
+                    self.right_arrow_detected = True
+                    self.right_detected_since = time.time()
+            elif self.turn_right_counter == 0:
+                self.right_arrow_detected = False
+                self.right_detected_since = None
+
             # Traffic light detection (debounced)
             tl_color, tl_pt = self.detect_traffic_light(frame)
             if tl_color == 'red':
@@ -326,8 +437,33 @@ class LineFollowerNode(Node):
             # Base linear velocity
             linear_vel = self.max_linear_vel
 
+            # If right arrow detected, wait then start a sustained turn
+            if self.right_arrow_detected:
+                # if still in cooldown, ignore detection
+                if time.time() < self.right_cooldown_until:
+                    # do nothing special, proceed with normal steering
+                    pass
+                else:
+                    # ensure we have a start time for waiting
+                    if self.right_detected_since is None:
+                        self.right_detected_since = time.time()
+                    elapsed = time.time() - self.right_detected_since
+                    if elapsed < self.right_wait_sec:
+                        # show waiting countdown on debug image while still moving towards sign
+                        cv2.putText(debug_img, f'Approaching then turn: {self.right_wait_sec - elapsed:.1f}s', (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    else:
+                        # start the sustained turn period
+                        if time.time() >= self.executing_turn_until:
+                            self.executing_turn_until = time.time() + self.turn_duration
+                            self.get_logger().info('Starting sustained right turn')
+                            # set a cooldown to avoid immediate re-trigger after the turn
+                            self.right_cooldown_until = time.time() + 4.0
+                            # reset detection counters
+                            self.right_arrow_detected = False
+                            self.turn_right_counter = 0
+                            self.right_detected_since = None
             # Modify linear velocity based on traffic light state
-            if self.traffic_state == 'red':
+            elif self.traffic_state == 'red':
                 # mark time when robot first stopped for red
                 if self.red_stop_since is None:
                     self.red_stop_since = time.time()
@@ -347,6 +483,16 @@ class LineFollowerNode(Node):
             elif self.traffic_state == 'green':
                 self.red_stop_since = None
                 linear_vel = self.max_linear_vel
+
+            # If currently executing a sustained turn, override steering for the duration
+            if time.time() < self.executing_turn_until:
+                # sustain a right turn: negative angular for right (node uses -angular_vel)
+                angular_vel = self.turn_angular_speed
+                linear_vel = 0.1
+            else:
+                # clear executing flag when done
+                if self.executing_turn_until != 0.0 and time.time() >= self.executing_turn_until:
+                    self.executing_turn_until = 0.0
 
             # Publish velocity command
             twist = Twist()
@@ -373,6 +519,19 @@ class LineFollowerNode(Node):
                 (0, 255, 0),
                 2
             )
+
+            # Display right arrow detection status
+            if self.right_arrow_detected:
+                cv2.putText(
+                    debug_img,
+                    'RIGHT ARROW DETECTED!',
+                    (10, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 0, 255),
+                    2
+                )
+                cv2.rectangle(debug_img, (5, 100), (debug_img.shape[1]-5, 125), (0, 0, 255), 2)
 
             # Display detected traffic light on debug image
             if tl_color is not None and tl_pt is not None:
