@@ -16,12 +16,11 @@ The line follower uses:
 - Subscribes to camera feed (default: `/camera/image_raw`)
 - Applies Canny edge detection to find lane boundaries
 - Detects free space and calculates steering angle
-- **SIFT-based Stop Sign Detection**: Detects stop signs in the robot's view and stops
 - Publishes velocity commands to `/cmd_vel`
 - Shows 3 debug windows:
   - **Original**: Raw camera frame
-  - **Canny Edges**: Detected edges from Canny filter (only when no stop sign)
-  - **Debug - Free Space**: Free space contours and centroid (or STOP sign alert)
+  - **Canny Edges**: Detected edges from Canny filter
+  - **Debug - Free Space**: Free space contours and centroid
 
 ## Installation
 
@@ -71,23 +70,19 @@ ros2 launch line_follower_fsdetect line_follower.launch.py \
 | `canny_threshold2` | `150` | Canny upper threshold |
 | `max_linear_vel` | `0.2` | Maximum forward velocity (m/s) |
 | `max_angular_vel` | `1.0` | Maximum rotation velocity (rad/s) |
-| `stop_sign_path` | `''` | Path to stop sign template image for SIFT detection |
 
 ## How It Works
 
 1. **Image Capture**: Subscribes to camera feed
-2. **Stop Sign Detection**: Checks each frame for stop signs using SIFT matching
-   - If stop sign detected: Robot stops (zero velocity)
-   - If no stop sign: Continues to line following
-3. **Preprocessing**: Converts to grayscale
-4. **Edge Detection**: Applies Canny edge detection
-5. **Free Space Analysis**:
+2. **Preprocessing**: Converts to grayscale
+3. **Edge Detection**: Applies Canny edge detection
+4. **Free Space Analysis**:
    - Scans horizontally at the bottom for lane boundaries
    - Vertically scans from bottom to find obstacles/edges
    - Calculates the centroid of the free space
-6. **Steering Calculation**: Converts centroid position to steering angle
-7. **Command Output**: Publishes Twist message for robot motion
-8. **Visualization**: Displays debug images with `cv2.imshow()`
+5. **Steering Calculation**: Converts centroid position to steering angle
+6. **Command Output**: Publishes Twist message for robot motion
+7. **Visualization**: Displays debug images with `cv2.imshow()`
 
 ## Keyboard Controls
 
@@ -110,12 +105,6 @@ ros2 launch line_follower_fsdetect line_follower.launch.py \
   - Increase `canny_threshold2` for less noise
 - Adjust `max_linear_vel` and `max_angular_vel`
 - Ensure good lighting conditions for edge detection
-
-### Stop sign not being detected
-- Check stop sign image quality at `/home/alex/turtlebot3_ws/src/line_follower_fsdetect/stop_sign.png`
-- Ensure the template image is clear and visible
-- Try adjusting SIFT match threshold (min 10 matches required) in code
-- Ensure good lighting for SIFT feature detection
 
 ## File Structure
 

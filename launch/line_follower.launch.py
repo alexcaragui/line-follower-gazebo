@@ -26,9 +26,9 @@ def generate_launch_description():
             {'cmd_vel_topic': '/cmd_vel'},
             {'canny_threshold1': 50},
             {'canny_threshold2': 150},
-            {'max_linear_vel': 0.2},
+            {'max_linear_vel': 0.15},
             {'max_angular_vel': 1.0},
-            {'stop_sign_path': stop_sign_path},
+            {'stop_sign_path': ''},
             {'show_debug': False},
         ]
     )
