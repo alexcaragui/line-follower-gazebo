@@ -111,6 +111,10 @@ class LineFollowerNode(Node):
         self.turn_duration = 1.2  # seconds to perform the turn once started
         self.turn_angular_speed = 1.0  # angular speed used during turn
         
+        # Red-white barrier detection (stops robot until barrier disappears from center)
+        self.barrier_detected = False
+        self.barrier_detection_threshold = 0.15  # min ratio of red+white pixels in center ROI
+        
         # Load stop sign template if provided
         if stop_sign_path and os.path.exists(stop_sign_path):
             self.stop_sign_template = cv2.imread(stop_sign_path)
@@ -137,6 +141,21 @@ class LineFollowerNode(Node):
                 self.get_logger().warn(f'Failed to load right arrow from {right_arrow_path}')
         else:
             self.get_logger().info(f'Right arrow template not found at {right_arrow_path}')
+        # Load interzis (prohibited) sign template and prepare descriptors
+        interzis_path = os.path.join(pkg_dir, 'interzis.png')
+        self.interzis_template = None
+        self.interzis_kp = None
+        self.interzis_des = None
+        if os.path.exists(interzis_path):
+            self.interzis_template = cv2.imread(interzis_path, 0)
+            if self.interzis_template is not None:
+                self.interzis_kp, self.interzis_des = self.sift.detectAndCompute(self.interzis_template, None)
+                self.get_logger().info(f'Loaded interzis template from {interzis_path}')
+                self.get_logger().info(f'Interzis has {len(self.interzis_kp)} SIFT keypoints')
+            else:
+                self.get_logger().warn(f'Failed to load interzis from {interzis_path}')
+        else:
+            self.get_logger().info(f'Interzis template not found at {interzis_path}')
         
         # Create subscriptions and publishers
         self.image_sub = self.create_subscription(
@@ -319,6 +338,82 @@ class LineFollowerNode(Node):
             self.get_logger().warn(f'Error in right arrow SIFT detection: {e}')
             return False
     
+    def detect_interzis_sign(self, frame_gray):
+        """Detect interzis sign (prohibited) using SIFT+FLANN matching.
+        Returns True if detected with sufficient matches and low MSE, False otherwise."""
+        if self.interzis_des is None or self.interzis_kp is None or len(self.interzis_kp) < self.MIN_MATCH_COUNT:
+            return False
+        try:
+            kp_frame, des_frame = self.sift.detectAndCompute(frame_gray, None)
+            if des_frame is None or len(kp_frame) < self.MIN_MATCH_COUNT:
+                return False
+            matches = self.flann_matcher.knnMatch(des_frame, self.interzis_des, k=2)
+            good_matches = []
+            for match_pair in matches:
+                if len(match_pair) == 2:
+                    m, n = match_pair
+                    if m.distance < 0.7 * n.distance:
+                        good_matches.append(m)
+            if len(good_matches) < self.MIN_MATCH_COUNT:
+                return False
+            try:
+                src_pts = np.float32([kp_frame[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                dst_pts = np.float32([self.interzis_kp[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                mse = np.sum((src_pts - dst_pts) ** 2) / len(src_pts)
+                if mse < self.MIN_MSE_DECISION:
+                    self.get_logger().info(f'Interzis sign detected! MSE: {mse:.2f}, Matches: {len(good_matches)}')
+                    return True
+            except Exception as e:
+                self.get_logger().warn(f'Homography error in interzis detection: {e}')
+                return False
+            return False
+        except Exception as e:
+            self.get_logger().warn(f'Error in interzis SIFT detection: {e}')
+            return False
+
+    def detect_red_white_barrier(self, frame_bgr):
+        """Detect red and white barrier in the center of the screen.
+        Returns True if red+white pixels ratio in center ROI exceeds threshold, False otherwise."""
+        try:
+            h, w = frame_bgr.shape[:2]
+            # Define center ROI (middle 30-70% width, 25-75% height)
+            x_start = int(w * 0.30)
+            x_end = int(w * 0.70)
+            y_start = int(h * 0.25)
+            y_end = int(h * 0.75)
+            roi = frame_bgr[y_start:y_end, x_start:x_end]
+            
+            # Convert to HSV
+            roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            
+            # Red detection (using traffic light red thresholds)
+            lower_red = np.array([self.hue_red_l, self.saturation_red_l, self.lightness_red_l])
+            upper_red = np.array([self.hue_red_h, self.saturation_red_h, self.lightness_red_h])
+            red_mask = cv2.inRange(roi_hsv, lower_red, upper_red)
+            
+            # White detection (low saturation, high value)
+            lower_white = np.array([0, 0, 200])
+            upper_white = np.array([180, 30, 255])
+            white_mask = cv2.inRange(roi_hsv, lower_white, upper_white)
+            
+            # Combine red and white masks
+            combined_mask = cv2.bitwise_or(red_mask, white_mask)
+            
+            # Calculate ratio
+            roi_pixels = roi.shape[0] * roi.shape[1]
+            barrier_pixels = cv2.countNonZero(combined_mask)
+            ratio = barrier_pixels / roi_pixels if roi_pixels > 0 else 0
+            
+            # Log detection with ratio for debugging
+            if ratio > 0.01:  # Log only if some detection
+                self.get_logger().info(f'Barrier detection ratio: {ratio:.4f}, Threshold: {self.barrier_detection_threshold:.4f}')
+            
+            return ratio >= self.barrier_detection_threshold
+        except Exception as e:
+            self.get_logger().warn(f'Error in barrier detection: {e}')
+            return False
+
     def image_callback(self, msg):
         """Process camera image and calculate steering command."""
         try:
@@ -333,6 +428,9 @@ class LineFollowerNode(Node):
         
         # Check for stop sign using SIFT
         stop_sign_detected = self.detect_stop_sign_sift(gray)
+        
+        # Check for red-white barrier in center
+        barrier_detected = self.detect_red_white_barrier(frame)
         
         # Create debug image (BGR copy of original)
         debug_img = frame.copy()
@@ -359,18 +457,38 @@ class LineFollowerNode(Node):
                 3
             )
             cv2.rectangle(debug_img, (20, 20), (debug_img.shape[1]-20, debug_img.shape[0]-20), (0, 0, 255), 3)
+        elif barrier_detected:
+            self.get_logger().info('RED-WHITE BARRIER DETECTED! Stopping robot.')
+            self.barrier_detected = True
+            
+            # Publish zero velocity
+            twist = Twist()
+            twist.linear.x = 0.0
+            twist.angular.z = 0.0
+            self.cmd_vel_pub.publish(twist)
+            
+            # Display barrier message
+            cv2.putText(
+                debug_img,
+                'BARRIER DETECTED!',
+                (50, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.5,
+                (0, 255, 255),
+                3
+            )
+            cv2.rectangle(debug_img, (20, 20), (debug_img.shape[1]-20, debug_img.shape[0]-20), (0, 255, 255), 3)
         else:
             self.stop_sign_detected = False
-            
-            # Apply Canny edge detection
+            self.barrier_detected = False
             edges = cv2.Canny(
                 gray,
                 self.canny_threshold1,
                 self.canny_threshold2
             )
 
-            # Detect right-arrow sign (debounced) with cooldown
-            right_arrow_detected = self.detect_right_arrow_sign(gray)
+            # Detect right-arrow or interzis sign (debounced) with cooldown
+            right_arrow_detected = self.detect_right_arrow_sign(gray) or self.detect_interzis_sign(gray)
             # ignore detection if in cooldown period
             if time.time() < self.right_cooldown_until:
                 right_arrow_detected = False
