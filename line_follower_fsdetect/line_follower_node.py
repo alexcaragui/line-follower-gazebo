@@ -110,6 +110,15 @@ class LineFollowerNode(Node):
         self.executing_turn_until = 0.0
         self.turn_duration = 1.2  # seconds to perform the turn once started
         self.turn_angular_speed = 1.0  # angular speed used during turn
+        self.turn_direction = None  # 'left' or 'right' to track which turn is executing
+        
+        # Left arrow detection state (sustained left turn, similar to right arrow)
+        self.left_arrow_detected = False
+        self.turn_left_counter = 0
+        self.turn_left_threshold = 3  # confirm detection over N frames
+        self.left_detected_since = None
+        self.left_wait_sec = 3.0  # seconds to approach before executing turn
+        self.left_cooldown_until = 0.0
         
         # Red-white barrier detection (stops robot until barrier disappears from center)
         self.barrier_detected = False
@@ -141,6 +150,23 @@ class LineFollowerNode(Node):
                 self.get_logger().warn(f'Failed to load right arrow from {right_arrow_path}')
         else:
             self.get_logger().info(f'Right arrow template not found at {right_arrow_path}')
+        # Load left arrow template
+        left_arrow_path = os.path.join(pkg_dir, 'left.png')
+        self.left_arrow_template = None
+        self.left_arrow_kp = None
+        self.left_arrow_des = None
+        if os.path.exists(left_arrow_path):
+            self.left_arrow_template = cv2.imread(left_arrow_path, 0)  # grayscale
+            if self.left_arrow_template is not None:
+                self.left_arrow_kp, self.left_arrow_des = self.sift.detectAndCompute(
+                    self.left_arrow_template, None
+                )
+                self.get_logger().info(f'Loaded left arrow template from {left_arrow_path}')
+                self.get_logger().info(f'Left arrow has {len(self.left_arrow_kp)} SIFT keypoints')
+            else:
+                self.get_logger().warn(f'Failed to load left arrow from {left_arrow_path}')
+        else:
+            self.get_logger().info(f'Left arrow template not found at {left_arrow_path}')
         # Load interzis (prohibited) sign template and prepare descriptors
         interzis_path = os.path.join(pkg_dir, 'interzis.png')
         self.interzis_template = None
@@ -154,6 +180,33 @@ class LineFollowerNode(Node):
                 self.get_logger().info(f'Interzis has {len(self.interzis_kp)} SIFT keypoints')
             else:
                 self.get_logger().warn(f'Failed to load interzis from {interzis_path}')
+        # Load construction template for avoidance
+        self.construction_template = None
+        self.construction_kp = None
+        self.construction_des = None
+        construction_path = os.path.join(pkg_dir, 'construction.png')
+        if os.path.exists(construction_path):
+            self.construction_template = cv2.imread(construction_path, 0)
+            if self.construction_template is not None:
+                self.construction_kp, self.construction_des = self.sift.detectAndCompute(self.construction_template, None)
+                self.get_logger().info(f'Loaded construction template from {construction_path}')
+                self.get_logger().info(f'Construction template has {len(self.construction_kp)} SIFT keypoints')
+            else:
+                self.get_logger().warn(f'Failed to load construction from {construction_path}')
+        else:
+            self.get_logger().info(f'Construction template not found at {construction_path}')
+
+        # Construction avoidance state fields
+        self.construction_counter = 0
+        self.construction_threshold = 3
+        self.construction_detected = False
+        self.construction_detected_since = None
+        self.construction_cooldown_until = 0.0
+        self.construction_wait_sec = 0.5
+        self.executing_avoid_until = 0.0
+        self.avoid_duration = 2.0
+        self.avoid_angular_speed = 0.9
+        self.avoid_linear_speed = 0.05
         else:
             self.get_logger().info(f'Interzis template not found at {interzis_path}')
         
@@ -338,6 +391,55 @@ class LineFollowerNode(Node):
             self.get_logger().warn(f'Error in right arrow SIFT detection: {e}')
             return False
     
+    def detect_left_arrow_sign(self, frame_gray):
+        """Detect left-arrow sign using SIFT+FLANN matching.
+        Returns True if detected with sufficient matches and low MSE, False otherwise."""
+        if self.left_arrow_des is None or len(self.left_arrow_kp) < self.MIN_MATCH_COUNT:
+            return False
+        
+        try:
+            kp_frame, des_frame = self.sift.detectAndCompute(frame_gray, None)
+            
+            if des_frame is None or len(kp_frame) < self.MIN_MATCH_COUNT:
+                return False
+            
+            # Use FLANN matcher
+            matches = self.flann_matcher.knnMatch(des_frame, self.left_arrow_des, k=2)
+            
+            # Apply Lowe's ratio test
+            good_matches = []
+            for match_pair in matches:
+                if len(match_pair) == 2:
+                    m, n = match_pair
+                    if m.distance < 0.7 * n.distance:
+                        good_matches.append(m)
+            
+            # Check if enough matches
+            if len(good_matches) < self.MIN_MATCH_COUNT:
+                return False
+            
+            # Compute homography and MSE to verify match quality
+            try:
+                src_pts = np.float32([kp_frame[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                dst_pts = np.float32([self.left_arrow_kp[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                
+                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                
+                # Calculate MSE
+                mse = np.sum((src_pts - dst_pts) ** 2) / len(src_pts)
+                
+                if mse < self.MIN_MSE_DECISION:
+                    self.get_logger().info(f'Left arrow detected! MSE: {mse:.2f}, Matches: {len(good_matches)}')
+                    return True
+            except Exception as e:
+                self.get_logger().warn(f'Homography error in left arrow detection: {e}')
+                return False
+            
+            return False
+        except Exception as e:
+            self.get_logger().warn(f'Error in left arrow SIFT detection: {e}')
+            return False
+    
     def detect_interzis_sign(self, frame_gray):
         """Detect interzis sign (prohibited) using SIFT+FLANN matching.
         Returns True if detected with sufficient matches and low MSE, False otherwise."""
@@ -370,6 +472,40 @@ class LineFollowerNode(Node):
             return False
         except Exception as e:
             self.get_logger().warn(f'Error in interzis SIFT detection: {e}')
+            return False
+
+    def detect_construction_sign(self, frame_gray):
+        """Detect construction sign using SIFT+FLANN matching.
+        Returns True if detected with sufficient matches and low MSE, False otherwise."""
+        if self.construction_des is None or self.construction_kp is None or len(self.construction_kp) < self.MIN_MATCH_COUNT:
+            return False
+        try:
+            kp_frame, des_frame = self.sift.detectAndCompute(frame_gray, None)
+            if des_frame is None or len(kp_frame) < self.MIN_MATCH_COUNT:
+                return False
+            matches = self.flann_matcher.knnMatch(des_frame, self.construction_des, k=2)
+            good_matches = []
+            for match_pair in matches:
+                if len(match_pair) == 2:
+                    m, n = match_pair
+                    if m.distance < 0.7 * n.distance:
+                        good_matches.append(m)
+            if len(good_matches) < self.MIN_MATCH_COUNT:
+                return False
+            try:
+                src_pts = np.float32([kp_frame[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                dst_pts = np.float32([self.construction_kp[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                mse = np.sum((src_pts - dst_pts) ** 2) / len(src_pts)
+                if mse < self.MIN_MSE_DECISION:
+                    self.get_logger().info(f'Construction sign detected! MSE: {mse:.2f}, Matches: {len(good_matches)}')
+                    return True
+            except Exception as e:
+                self.get_logger().warn(f'Homography error in construction detection: {e}')
+                return False
+            return False
+        except Exception as e:
+            self.get_logger().warn(f'Error in construction SIFT detection: {e}')
             return False
 
     def detect_red_white_barrier(self, frame_bgr):
@@ -487,6 +623,44 @@ class LineFollowerNode(Node):
                 self.canny_threshold2
             )
 
+            # Detect construction sign (debounced) with cooldown
+            construction_detected = self.detect_construction_sign(gray)
+            if time.time() < self.construction_cooldown_until:
+                construction_detected = False
+            if construction_detected:
+                self.construction_counter += 1
+            else:
+                self.construction_counter = max(0, self.construction_counter - 1)
+
+            # Confirm construction detection over threshold frames
+            if self.construction_counter >= self.construction_threshold:
+                if not self.construction_detected:
+                    self.construction_detected = True
+                    self.construction_detected_since = time.time()
+            elif self.construction_counter == 0:
+                self.construction_detected = False
+                self.construction_detected_since = None
+
+            # Detect left-arrow sign (debounced) with cooldown
+            left_arrow_detected = self.detect_left_arrow_sign(gray)
+            # ignore detection if in cooldown period
+            if time.time() < self.left_cooldown_until:
+                left_arrow_detected = False
+            if left_arrow_detected:
+                self.turn_left_counter += 1
+            else:
+                self.turn_left_counter = max(0, self.turn_left_counter - 1)
+
+            # Confirm left arrow detection over threshold frames
+            if self.turn_left_counter >= self.turn_left_threshold:
+                if not self.left_arrow_detected:
+                    # start waiting timer before turning
+                    self.left_arrow_detected = True
+                    self.left_detected_since = time.time()
+            elif self.turn_left_counter == 0:
+                self.left_arrow_detected = False
+                self.left_detected_since = None
+
             # Detect right-arrow or interzis sign (debounced) with cooldown
             right_arrow_detected = self.detect_right_arrow_sign(gray) or self.detect_interzis_sign(gray)
             # ignore detection if in cooldown period
@@ -555,6 +729,55 @@ class LineFollowerNode(Node):
             # Base linear velocity
             linear_vel = self.max_linear_vel
 
+            # If construction detected, wait then start avoidance maneuver
+            if self.construction_detected:
+                # if still in cooldown, ignore detection
+                if time.time() < self.construction_cooldown_until:
+                    pass
+                else:
+                    if self.construction_detected_since is None:
+                        self.construction_detected_since = time.time()
+                    elapsed = time.time() - self.construction_detected_since
+                    if elapsed < self.construction_wait_sec:
+                        cv2.putText(debug_img, f'Construction ahead: {self.construction_wait_sec - elapsed:.1f}s', (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+                    else:
+                        # schedule avoidance execution
+                        if time.time() >= self.executing_avoid_until:
+                            self.executing_avoid_until = time.time() + self.avoid_duration
+                            self.get_logger().info('Starting construction avoidance maneuver')
+                            # set a cooldown to avoid immediate re-trigger after avoidance
+                            self.construction_cooldown_until = time.time() + 5.0
+                            # reset detection counters
+                            self.construction_detected = False
+                            self.construction_counter = 0
+                            self.construction_detected_since = None
+
+            # If left arrow detected, wait then start a sustained turn
+            if self.left_arrow_detected:
+                # if still in cooldown, ignore detection
+                if time.time() < self.left_cooldown_until:
+                    # do nothing special, proceed with normal steering
+                    pass
+                else:
+                    # ensure we have a start time for waiting
+                    if self.left_detected_since is None:
+                        self.left_detected_since = time.time()
+                    elapsed = time.time() - self.left_detected_since
+                    if elapsed < self.left_wait_sec:
+                        # show waiting countdown on debug image while still moving towards sign
+                        cv2.putText(debug_img, f'Approaching then turn left: {self.left_wait_sec - elapsed:.1f}s', (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 165, 0), 2)
+                    else:
+                        # start the sustained turn period
+                        if time.time() >= self.executing_turn_until:
+                            self.executing_turn_until = time.time() + self.turn_duration
+                            self.turn_direction = 'left'
+                            self.get_logger().info('Starting sustained left turn')
+                            # set a cooldown to avoid immediate re-trigger after the turn
+                            self.left_cooldown_until = time.time() + 4.0
+                            # reset detection counters
+                            self.left_arrow_detected = False
+                            self.turn_left_counter = 0
+                            self.left_detected_since = None
             # If right arrow detected, wait then start a sustained turn
             if self.right_arrow_detected:
                 # if still in cooldown, ignore detection
@@ -573,6 +796,7 @@ class LineFollowerNode(Node):
                         # start the sustained turn period
                         if time.time() >= self.executing_turn_until:
                             self.executing_turn_until = time.time() + self.turn_duration
+                            self.turn_direction = 'right'
                             self.get_logger().info('Starting sustained right turn')
                             # set a cooldown to avoid immediate re-trigger after the turn
                             self.right_cooldown_until = time.time() + 4.0
@@ -603,14 +827,25 @@ class LineFollowerNode(Node):
                 linear_vel = self.max_linear_vel
 
             # If currently executing a sustained turn, override steering for the duration
-            if time.time() < self.executing_turn_until:
-                # sustain a right turn: negative angular for right (node uses -angular_vel)
+            # If currently executing a construction avoidance maneuver, override steering for the duration
+            if time.time() < self.executing_avoid_until:
+                angular_vel = self.avoid_angular_speed
+                linear_vel = self.avoid_linear_speed
+            # If currently executing a sustained left turn, override steering for the duration
+            elif time.time() < self.executing_turn_until and self.turn_direction == 'left':
+                # sustain a left turn: positive angular for left (node uses -angular_vel, so positive becomes left)
+                angular_vel = -self.turn_angular_speed  # negative angular because Twist uses negative for left
+                linear_vel = 0.1
+            # If currently executing a sustained right turn, override steering for the duration
+            elif time.time() < self.executing_turn_until and self.turn_direction == 'right':
+                # sustain a right turn: negative angular for right (node uses -angular_vel, so negative becomes right)
                 angular_vel = self.turn_angular_speed
                 linear_vel = 0.1
             else:
                 # clear executing flag when done
                 if self.executing_turn_until != 0.0 and time.time() >= self.executing_turn_until:
                     self.executing_turn_until = 0.0
+                    self.turn_direction = None
 
             # Publish velocity command
             twist = Twist()
@@ -637,6 +872,19 @@ class LineFollowerNode(Node):
                 (0, 255, 0),
                 2
             )
+
+            # Display left arrow detection status
+            if self.left_arrow_detected:
+                cv2.putText(
+                    debug_img,
+                    'LEFT ARROW DETECTED!',
+                    (10, 145),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 165, 0),
+                    2
+                )
+                cv2.rectangle(debug_img, (5, 135), (debug_img.shape[1]-5, 160), (255, 165, 0), 2)
 
             # Display right arrow detection status
             if self.right_arrow_detected:
